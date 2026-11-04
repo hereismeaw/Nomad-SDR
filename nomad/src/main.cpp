@@ -1,0 +1,681 @@
+/* SPDX-License-Identifier: MIT */
+/* ESP32 port of pico/firmware/{main,stream}.c. See docs/nomad.md. */
+#include <Arduino.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <atomic>
+#include <algorithm>
+#include "esp32-hal-spi.h"
+#include "lwip/opt.h"
+#include "board.h"
+#include "compact.h"
+#include "indicators.h"
+#if __has_include("wifi.local.h")
+#include "wifi.local.h"
+#endif
+extern "C" {
+#include "protocol.h"
+#include "stream_format.h"
+}
+
+#ifndef NOMAD_AP_SSID
+#define NOMAD_AP_SSID "Nomad-SDR"
+#endif
+#ifndef NOMAD_AP_PASSWORD
+#define NOMAD_AP_PASSWORD "nomadsdr1121"
+#endif
+#ifndef NOMAD_STA_SSID
+#define NOMAD_STA_SSID ""
+#endif
+#ifndef NOMAD_STA_PASSWORD
+#define NOMAD_STA_PASSWORD ""
+#endif
+
+static bool fallbackAP=false;
+static uint64_t networkStarted;
+static char staSsid[33];
+static char staPass[65];
+static bool wifiStored=false;
+static Preferences wifiPrefs;
+static bool wifiConfigure(const char *line,Print &out,uint32_t id,bool uart);
+
+static bool staEnabled() { return staSsid[0]!=0; }
+static String jsonString(const String &value) {
+    String out="\"";
+    for (size_t i=0;i<value.length();++i) {
+        uint8_t c=value[i];
+        if (c=='\"' || c=='\\') { out+='\\'; out+=char(c); }
+        else if (c<32) { char escaped[7]; snprintf(escaped,sizeof(escaped),"\\u%04x",c); out+=escaped; }
+        else out+=char(c);
+    }
+    return out+'\"';
+}
+static void networkStatus(Print &out,uint32_t id) {
+    bool connected=staEnabled() && WiFi.status()==WL_CONNECTED;
+    out.printf("{\"id\":%lu,\"ok\":true,\"mode\":\"%s\",\"ssid\":%s,\"connected\":%s,\"status\":%d,\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"rssi_dbm\":%d,\"ap_enabled\":%s,\"ap_ip\":\"%s\",\"ports\":[1121,1122],\"stored\":%s}\n",
+        (unsigned long)id,staEnabled()?(fallbackAP?"AP_STA":"STA"):"AP",
+        jsonString(staEnabled()?String(staSsid):String(NOMAD_AP_SSID)).c_str(),
+        connected?"true":"false",int(WiFi.status()),WiFi.localIP().toString().c_str(),
+        WiFi.gatewayIP().toString().c_str(),WiFi.subnetMask().toString().c_str(),
+        connected?int(WiFi.RSSI()):0,fallbackAP?"true":"false",WiFi.softAPIP().toString().c_str(),
+        wifiStored?"true":"false");
+}
+static bool networkRequest(const char *line,Print &out,bool uart) {
+    unsigned long id=0; char command[16],extra;
+    int tokens=sscanf(line,"%lu %15s %c",&id,command,&extra);
+    if (tokens<2 || !id) return false;
+    if (indicatorsCommand(line,out,id)) return true;
+    if (!strcmp(command,"wifi")) {
+        if (tokens==2) { networkStatus(out,id); return true; }
+        return wifiConfigure(line,out,id,uart);
+    }
+    if (tokens!=2) return false;
+    if (!strcmp(command,"netbench")) {
+        static const uint8_t zeros[4*TCP_MSS]={0};
+        out.printf("{\"id\":%lu,\"ok\":true,\"bytes\":%u}\n",id,unsigned(sizeof(zeros)*64));
+        uint64_t start=esp_timer_get_time(); size_t sent=0;
+        for (unsigned i=0;i<64;++i) {
+            size_t n=out.write(zeros,sizeof(zeros)); sent+=n;
+            if (n!=sizeof(zeros)) break;
+        }
+        out.printf("{\"id\":%lu,\"ok\":true,\"sent\":%u,\"elapsed_us\":%llu,\"free_heap\":%u}\n",id,unsigned(sent),
+            (unsigned long long)(esp_timer_get_time()-start),ESP.getFreeHeap());
+        return true;
+    }
+    return false;
+}
+static void loadWifiCredentials() {
+    wifiPrefs.begin("nomadw", true);
+    wifiStored=wifiPrefs.isKey("set");
+    if (wifiStored) {
+        strlcpy(staSsid,wifiPrefs.getString("ssid").c_str(),sizeof(staSsid));
+        strlcpy(staPass,wifiPrefs.getString("pass").c_str(),sizeof(staPass));
+    } else {
+        strlcpy(staSsid,NOMAD_STA_SSID,sizeof(staSsid));
+        strlcpy(staPass,NOMAD_STA_PASSWORD,sizeof(staPass));
+    }
+    wifiPrefs.end();
+}
+static void saveWifiCredentials() {
+    wifiPrefs.begin("nomadw", false);
+    wifiPrefs.putUChar("set",1);
+    wifiPrefs.putString("ssid",staSsid);
+    wifiPrefs.putString("pass",staPass);
+    wifiPrefs.end();
+    wifiStored=true;
+}
+static void startNetwork() {
+    WiFi.persistent(false);
+    WiFi.setHostname("nomad-sdr");
+    WiFi.setSleep(false);
+    if (staEnabled()) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.begin(staSsid,staPass);
+        fallbackAP=false;
+    } else {
+        WiFi.mode(WIFI_AP);
+        if (!WiFi.softAP(NOMAD_AP_SSID,NOMAD_AP_PASSWORD,1,false,2)) abort();
+        fallbackAP=true;
+    }
+    networkStarted=esp_timer_get_time();
+}
+static void networkTick() {
+    // Leave USB control usable while associating. Open the recovery AP if
+    // association fails; the station keeps reconnecting automatically.
+    if (staEnabled() && !fallbackAP && WiFi.status()!=WL_CONNECTED &&
+        esp_timer_get_time()-networkStarted>=20000000) {
+        WiFi.mode(WIFI_AP_STA);
+        fallbackAP=WiFi.softAP(NOMAD_AP_SSID,NOMAD_AP_PASSWORD,1,false,2);
+    }
+}
+
+static SPIClass radioSPI(VSPI);
+static SemaphoreHandle_t spiMutex;
+static SemaphoreHandle_t streamMutex;
+static WiFiServer servers[2] = {WiFiServer(board::port[0]), WiFiServer(board::port[1])};
+
+struct Frame {
+    uint32_t sequence, timestamp, samples, payloadBytes;
+    uint8_t bytes[IQ_FRAME_BYTES];
+};
+struct Radio {
+    unsigned index;
+    WiFiClient client;
+    Stream *io = &client;
+    SemaphoreHandle_t owner;
+    bool serialSession = false;
+    bool compact = false;
+    bool decimated = false;
+    nomad_decimator_t decimator;
+    QueueHandle_t queue;
+    StaticQueue_t queueControl;
+    uint8_t *queueStorage;
+    unsigned queueCapacity;
+    request_t req;
+    char line[BRIDGE_LINE_SIZE];
+    uint8_t rx[BRIDGE_MAX_BYTES + 1];
+    uint8_t networkGroup[4*TCP_MSS+IQ_FRAME_BYTES];
+    uint32_t speed = 500000;
+    std::atomic<bool> active{false}, done{false}, stop{false};
+    uint32_t flags, produced, readOps, maxQueue, maxBlock, blocks, rate;
+    uint32_t jobId;
+    uint64_t start, deadline;
+};
+static Radio radios[2];
+
+static bool nextToken(const char *&p,char *out,size_t cap) {
+    while (*p==' ' || *p=='\t') ++p;
+    if (!*p) { if (cap) out[0]=0; return false; }
+    size_t n=0;
+    if (*p=='"') {
+        ++p;
+        while (*p && *p!='"') {
+            char c=*p++;
+            if (c=='\\' && *p) c=*p++;
+            if (n+1>=cap) return false;
+            out[n++]=c;
+        }
+        if (*p!='"') return false;
+        ++p;
+        out[n]=0;
+        return true;
+    }
+    while (*p && *p!=' ' && *p!='\t') {
+        if (n+1>=cap) return false;
+        out[n++]=*p++;
+    }
+    out[n]=0;
+    return true;
+}
+static bool wifiConfigure(const char *line,Print &out,uint32_t id,bool uart) {
+    const char *p=line;
+    char skipped[16],mode[8],ssid[33],pass[65],extra[8];
+    if (!nextToken(p,skipped,sizeof(skipped)) || !nextToken(p,skipped,sizeof(skipped))) return false;
+    if (!nextToken(p,mode,sizeof(mode))) { networkStatus(out,id); return true; }
+    if (!uart) {
+        out.printf("{\"id\":%lu,\"ok\":false,\"error\":\"wifi_uart_only\",\"phase\":\"admission\"}\n",(unsigned long)id);
+        return true;
+    }
+    if (radios[0].active.load() || radios[1].active.load()) {
+        out.printf("{\"id\":%lu,\"ok\":false,\"error\":\"wifi_busy_streaming\",\"phase\":\"admission\"}\n",(unsigned long)id);
+        return true;
+    }
+    if (!strcmp(mode,"ap")) {
+        if (nextToken(p,extra,sizeof(extra))) {
+            out.printf("{\"id\":%lu,\"ok\":false,\"error\":\"wifi_ap\",\"phase\":\"parse\"}\n",(unsigned long)id);
+            return true;
+        }
+        staSsid[0]=0; staPass[0]=0;
+        saveWifiCredentials();
+        WiFi.disconnect(true,true);
+        startNetwork();
+        networkStatus(out,id);
+        return true;
+    }
+    if (strcmp(mode,"sta") || !nextToken(p,ssid,sizeof(ssid)) || !ssid[0] ||
+        !nextToken(p,pass,sizeof(pass)) || nextToken(p,extra,sizeof(extra))) {
+        out.printf("{\"id\":%lu,\"ok\":false,\"error\":\"wifi_sta_ssid_password\",\"phase\":\"parse\"}\n",(unsigned long)id);
+        return true;
+    }
+    strlcpy(staSsid,ssid,sizeof(staSsid));
+    strlcpy(staPass,pass,sizeof(staPass));
+    saveWifiCredentials();
+    WiFi.disconnect(true,true);
+    startNetwork();
+    networkStatus(out,id);
+    return true;
+}
+
+// The lock covers both CS assertions of read commands. A second radio cannot
+// change the bus frequency or interleave its command with a pending response.
+struct BusLock {
+    BusLock() { xSemaphoreTake(spiMutex, portMAX_DELAY); }
+    ~BusLock() { xSemaphoreGive(spiMutex); }
+};
+static uint64_t now() { return esp_timer_get_time(); }
+static void be32(uint8_t *p, uint32_t v) {
+    p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v;
+}
+static bool ready(Radio &r, uint32_t ms) {
+    uint64_t until=now()+uint64_t(ms)*1000;
+    uint64_t lastYield=now();
+    while (ms && digitalRead(board::busy[r.index])) {
+        if (now()>=until) return false;
+        delayMicroseconds(5);
+        if (now()-lastYield>=1000) { vTaskDelay(1); lastYield=now(); }
+    }
+    return true;
+}
+static void transfer(Radio &r, const uint8_t *tx, uint8_t *rx, size_t n) {
+    radioSPI.beginTransaction(SPISettings(r.speed, MSBFIRST, SPI_MODE0));
+    digitalWrite(board::cs[r.index], LOW);
+    delayMicroseconds(1);
+    // The Arduino HAL loads whole 32-bit words, including a partial final
+    // word. Stage short/unaligned buffers and explicitly send zero dummy bytes.
+    alignas(4) uint8_t txChunk[64], rxChunk[64];
+    for (size_t offset=0;offset<n;offset+=64) {
+        size_t count=std::min(size_t(64),n-offset);
+        memset(txChunk,0,sizeof(txChunk));
+        if (tx) memcpy(txChunk,tx+offset,count);
+        radioSPI.transferBytes(txChunk,rx?rxChunk:nullptr,count);
+        if (rx) memcpy(rx+offset,rxChunk,count);
+    }
+    digitalWrite(board::cs[r.index], HIGH);
+    radioSPI.endTransaction();
+    delayMicroseconds(5);
+}
+static bool readMem(Radio &r, uint32_t address, uint32_t words) {
+    uint8_t c[7]={1,6,0,0,0,0,uint8_t(words)};
+    be32(c+2,address);
+    BusLock lock;
+    if (!ready(r,20)) return false;
+    transfer(r,c,nullptr,sizeof(c));
+    if (!ready(r,20)) return false;
+    transfer(r,nullptr,r.rx,words*4+1);
+    ++r.readOps;
+    return (r.rx[0]>>1)==3;
+}
+static bool word(Radio &r,uint32_t address,uint32_t &value) {
+    if (!readMem(r,address,1)) return false;
+    value=iq_be32(r.rx+1); return true;
+}
+static bool masked(Radio &r,uint32_t address,uint32_t mask,uint32_t value) {
+    uint8_t c[14]={1,12}, zero[6]={0}, status[6];
+    be32(c+2,address); be32(c+6,mask); be32(c+10,value);
+    BusLock lock;
+    if (!ready(r,20)) return false;
+    transfer(r,c,nullptr,sizeof(c));
+    if (!ready(r,20)) return false;
+    transfer(r,zero,status,sizeof(status));
+    return (status[0]>>1)==2;
+}
+static bool gate(Radio &r,bool enabled) {
+    return masked(r,0xf20014,0x30000010,enabled?0x30000010:0x30000000);
+}
+static void resetRadio(Radio &r) {
+    BusLock lock;
+    digitalWrite(board::cs[r.index],HIGH);
+    digitalWrite(board::reset[r.index],LOW); delay(10);
+    digitalWrite(board::reset[r.index],HIGH); delay(10);
+}
+static bool pointerValid(uint32_t p) {
+    return p==0x800a00 || p==0x800a10 ||
+        (p>=IQ_DESC_BASE+32 && p<IQ_DESC_BASE+IQ_BANKS*16 && !(p&15));
+}
+static bool validate(Radio &r) {
+    uint32_t v;
+    if (!word(r,0xf20124,v) || ((v>>20)&7)!=(r.rate==62500?5u:4u)) return false;
+    if (!word(r,0xf20014,v) || (v&0x30000010)!=0x30000000) return false;
+    if (!word(r,IQ_POINTER,v) || v!=0x800a00) return false;
+    for (unsigned i=0;i<IQ_BANKS;++i) {
+        if (!readMem(r,iq_descriptor(i),4)) return false;
+        if (iq_be32(r.rx+1)!=IQ_CONTROL || iq_be32(r.rx+5)!=0x901004 ||
+            iq_be32(r.rx+9)!=IQ_DATA_BASE+(i+1)*IQ_BANK_BYTES-4 ||
+            iq_be32(r.rx+13)!=iq_descriptor((i+1)%IQ_BANKS)) return false;
+    }
+    return true;
+}
+static void finishAcquisition(Radio &r) {
+    if (!gate(r,false)) {
+        r.flags|=IQ_RADIO_ERROR;
+        resetRadio(r); // A stuck command must not leave acquisition running.
+    }
+    r.done.store(true); // Publish counters before the sender reads them.
+}
+// One producer on core 1 owns both radios while streaming. Round-robin polling
+// avoids spinning on an empty bank of one radio while the other needs service.
+static void acquire(void *) {
+    Frame frame;
+    uint64_t lastYield=now();
+    for (;;) {
+        bool work=false;
+        for (Radio &r:radios) {
+            if (!r.active.load() || r.done.load()) continue;
+            if (!r.start) {
+                r.start=now(); r.deadline=r.start+1000000;
+                if (!gate(r,true)) r.flags|=IQ_RADIO_ERROR;
+            }
+            if (r.stop.load()) r.flags|=IQ_ABORT;
+            if (now()>=r.deadline) r.flags|=IQ_DEADLINE;
+            if (r.flags || (r.blocks && r.produced>=r.blocks)) { finishAcquisition(r); continue; }
+            uint32_t bank=r.produced%IQ_BANKS, desc=iq_descriptor(bank), control;
+            if (!word(r,desc,control)) { r.flags|=IQ_RADIO_ERROR; finishAcquisition(r); continue; }
+            if (control&3) continue;
+            work=true;
+            uint64_t begin=now();
+            if ((control&~0x001fff03u)!=(IQ_CONTROL&~0x001fff03u)) r.flags|=IQ_RADIO_ERROR;
+            for (unsigned w=0;w<IQ_BANK_BYTES/4 && !r.flags;w+=64) {
+                unsigned n=IQ_BANK_BYTES/4-w; if (n>64) n=64;
+                if (!readMem(r,IQ_DATA_BASE+bank*IQ_BANK_BYTES+w*4,n)) r.flags|=IQ_RADIO_ERROR;
+                else if (!iq_pack23(frame.bytes+IQ_HEADER_BYTES+w*3,r.rx+1,n)) r.flags|=IQ_FORMAT_ERROR;
+            }
+            uint32_t pointer=0;
+            if (!r.flags) {
+                if (!word(r,IQ_POINTER,pointer) || !pointerValid(pointer)) r.flags|=IQ_RADIO_ERROR;
+                else if (pointer==desc) {
+                    if (!word(r,IQ_POINTER,pointer)) r.flags|=IQ_RADIO_ERROR;
+                    else if (pointer==desc) r.flags|=IQ_DMA_STARVED;
+                }
+            }
+            if (!r.flags && !masked(r,desc,0xffffffffu,IQ_CONTROL)) r.flags|=IQ_RADIO_ERROR;
+            if (r.flags) { finishAcquisition(r); continue; }
+            frame.sequence=r.produced; frame.timestamp=uint32_t(now()-r.start);
+            frame.samples=IQ_SAMPLES;frame.payloadBytes=IQ_PAYLOAD_BYTES;
+            if(r.compact) {
+                uint8_t packed[COMPACT_PAYLOAD_BYTES];
+                if(r.decimated) {
+                    frame.samples=nomad_decimate8(packed,frame.bytes+IQ_HEADER_BYTES,&r.decimator);
+                    if(!frame.samples)r.flags|=IQ_FORMAT_ERROR;
+                    frame.payloadBytes=1+frame.samples*2;
+                } else {
+                    if(!nomad_pack8(packed,frame.bytes+IQ_HEADER_BYTES))r.flags|=IQ_FORMAT_ERROR;
+                    frame.payloadBytes=COMPACT_PAYLOAD_BYTES;
+                }
+                if(r.flags) {finishAcquisition(r);continue;}
+                memcpy(frame.bytes+IQ_HEADER_BYTES,packed,frame.payloadBytes);
+            }
+            if (xQueueSend(r.queue,&frame,0)!=pdTRUE) { r.flags|=IQ_QUEUE_FULL; finishAcquisition(r); continue; }
+            ++r.produced; r.deadline=now()+1000000;
+            r.maxQueue=std::max(r.maxQueue,uint32_t(uxQueueMessagesWaiting(r.queue)));
+            r.maxBlock=std::max(r.maxBlock,uint32_t(now()-begin));
+        }
+        // Keep the idle task/watchdog runnable even during indefinite captures.
+        // A 1 ms tick fits the 32-bank (32/64 ms) acquisition window.
+        if (!work || now()-lastYield>=10000) { vTaskDelay(1); lastYield=now(); }
+    }
+}
+static bool sendBytes(Radio &r,const uint8_t *p,size_t n) {
+    uint64_t until=now()+2000000;
+    while (n) {
+        if ((!r.serialSession && !r.client.connected()) || now()>=until) return false;
+        size_t sent=r.io->write(p,n);
+        if (sent) { p+=sent; n-=sent; } else delay(1);
+    }
+    return true;
+}
+static void failure(Radio &r,uint32_t id,const char *error,const char *phase,bool sent=false) {
+    r.io->printf("{\"id\":%lu,\"ok\":false,\"error\":\"%s\",\"phase\":\"%s\",\"command_sent\":%s}\n",
+        (unsigned long)id,error,phase,sent?"true":"false");
+}
+static void hexAppend(String &s,const uint8_t *data,size_t n) {
+    const char *digits="0123456789abcdef";
+    for (size_t i=0;i<n;++i) { s+=digits[data[i]>>4]; s+=digits[data[i]&15]; }
+}
+static void stream(Radio &r) {
+    request_t &q=r.req;
+    // LIQ1 on CP210x is smoke-only. Compact LIQ8/LID8 at 2 Mbaud is USB native mode.
+    if (r.serialSession && !r.compact && (!q.iterations || q.iterations>32)) {
+        failure(r,q.id,"serial_capture_max_32_blocks","validate"); return;
+    }
+    r.rate=q.command==CMD_STREAM?125000:q.sample_rate; r.blocks=q.iterations; r.jobId=q.id;
+    if (q.pause_ms || r.speed!=board::stream_spi || !validate(r)) {
+        failure(r,q.id,"stream_configuration","validate"); return;
+    }
+    xSemaphoreTake(streamMutex,portMAX_DELAY);
+    Radio &other=radios[1-r.index];
+    if (other.active.load() && r.rate+other.rate>125000) {
+        xSemaphoreGive(streamMutex);
+        failure(r,q.id,"dual_rate_max_62500_each","admission"); return;
+    }
+    // Reuse the same storage budget with smaller queue items for network modes.
+    // This gives /2 streaming about 400 ms of radio-side jitter headroom.
+    size_t itemBytes=r.compact?offsetof(Frame,bytes)+IQ_HEADER_BYTES+
+        (r.decimated?127u:COMPACT_PAYLOAD_BYTES):sizeof(Frame);
+    r.queueCapacity=board::queue_frames*sizeof(Frame)/itemBytes;
+    r.queue=xQueueCreateStatic(r.queueCapacity,itemBytes,r.queueStorage,&r.queueControl);
+    if(!r.queue)abort();
+    memset(&r.decimator,0,sizeof(r.decimator));
+    r.flags=r.produced=r.readOps=r.maxQueue=r.maxBlock=0;
+    r.start=0; r.stop.store(false); r.done.store(false);
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu}\n",
+        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks);
+    r.active.store(true);
+    xSemaphoreGive(streamMutex);
+    Frame frame;
+    bool connected=true;
+    uint32_t sent=0;
+    size_t groupBytes=0;
+    uint64_t dataSent=0;
+    while (!r.done.load() || uxQueueMessagesWaiting(r.queue) || groupBytes) {
+        while (r.io->available()) if (r.io->read()==3) r.stop.store(true);
+        if ((!r.serialSession && !r.client.connected())) { connected=false; r.stop.store(true); }
+        if (xQueueReceive(r.queue,&frame,pdMS_TO_TICKS(5))==pdTRUE) {
+            uint8_t *wire=frame.bytes;
+            size_t payload=frame.payloadBytes,frameBytes=IQ_HEADER_BYTES+payload;
+            iq_header_rate(wire,1,0,r.jobId,frame.sequence,frame.samples,payload,
+                frame.timestamp,iq_crc32(wire+IQ_HEADER_BYTES,payload),r.decimated?r.rate/2:r.rate);
+            if (r.compact) {
+                memcpy(wire,r.decimated?"LID8":"LIQ8",4);
+                if(r.decimated)iq_le32(wire+16,uint32_t((uint64_t(frame.sequence)*125+1)/2));
+                iq_le32(wire+40,iq_crc32(wire,40));
+            }
+            if (r.serialSession) {
+                if (connected && !sendBytes(r,wire,frameBytes)) { connected=false; r.stop.store(true); }
+                if (connected) ++sent;
+            } else {
+                // Fill complete TCP segments; LIQ1 frames may span writes.
+                // Avoid flushing a short trailing segment after every group.
+                memcpy(r.networkGroup+groupBytes,wire,frameBytes);
+                groupBytes+=frameBytes;
+            }
+        }
+        size_t flushBytes=groupBytes>=4*TCP_MSS?4*TCP_MSS:
+            (r.done.load() && !uxQueueMessagesWaiting(r.queue)?groupBytes:0);
+        if (flushBytes) {
+            if (connected && !sendBytes(r,r.networkGroup,flushBytes)) { connected=false; r.stop.store(true); }
+            if (connected) {
+                dataSent+=flushBytes;
+                // /2 data frames alternate 171 and 169 bytes, 340 per pair.
+                sent=r.decimated?uint32_t(dataSent/340)*2u+(dataSent%340>=171):
+                    uint32_t(dataSent/(IQ_HEADER_BYTES+(r.compact?COMPACT_PAYLOAD_BYTES:IQ_PAYLOAD_BYTES)));
+            }
+            groupBytes-=flushBytes;
+            memmove(r.networkGroup,r.networkGroup+flushBytes,groupBytes);
+        }
+    }
+    // done is the synchronization point; producer no longer accesses this job.
+    xSemaphoreTake(streamMutex,portMAX_DELAY);
+    r.active.store(false);
+    xSemaphoreGive(streamMutex);
+    if (!connected) r.flags|=IQ_USB_LOST; // Existing LIQ1 bit means transport lost.
+    uint8_t end[IQ_HEADER_BYTES+36], *stats=end+IQ_HEADER_BYTES;
+    uint32_t values[]={r.produced,sent,r.maxQueue,r.readOps,r.maxBlock,r.speed,
+        uint32_t(now()-r.start),r.flags&(IQ_DMA_STARVED|IQ_QUEUE_FULL|IQ_USB_LOST|IQ_RADIO_ERROR|IQ_FORMAT_ERROR)?0xffffffffu:0,r.blocks};
+    for (unsigned i=0;i<9;++i) iq_le32(stats+4*i,values[i]);
+    iq_header_rate(end,2,r.flags,q.id,r.produced,0,36,uint32_t(now()-r.start),iq_crc32(stats,36),r.decimated?r.rate/2:r.rate);
+    if (r.compact) {
+        memcpy(end,r.decimated?"LID8":"LIQ8",4);
+        if(r.decimated)iq_le32(end+16,uint32_t((uint64_t(r.produced)*125+1)/2));
+        iq_le32(end+40,iq_crc32(end,40));
+    }
+    if (connected && !sendBytes(r,end,sizeof(end))) connected=false;
+    if (!connected) r.client.stop();
+}
+static bool parseNomadRequest(char *line,request_t *req,bool *compact,bool *decimated,const char **error) {
+    *compact=false;*decimated=false;
+    unsigned long id=0,rate=0,blocks=0;
+    char command[16],extra;
+    if (sscanf(line,"%lu %15s",&id,command)==2 && (!strcmp(command,"stream8") || !strcmp(command,"streamd"))) {
+        if (sscanf(line,"%lu %15s %lu %lu %c",&id,command,&rate,&blocks,&extra)!=4) {
+            memset(req,0,sizeof(*req)); req->id=id; *error="stream8_rate_blocks"; return false;
+        }
+        char normalized[96];
+        snprintf(normalized,sizeof(normalized),"%lu stream2 %lu %lu",id,rate,blocks);
+        if (!parse_request(normalized,req,error)) return false;
+        *compact=true;*decimated=!strcmp(command,"streamd");return true;
+    }
+    return parse_request(line,req,error);
+}
+static void request(Radio &r) {
+    request_t &q=r.req;
+    switch(q.command) {
+    case CMD_INFO:
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.9.0\",\"board\":\"radiomaster-nomad\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
+            (unsigned long)q.id,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
+    case CMD_PINS:
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"cs\":%d,\"reset\":%d,\"busy\":%d,\"dio9\":%d}\n",(unsigned long)q.id,
+            digitalRead(board::cs[r.index]),digitalRead(board::reset[r.index]),digitalRead(board::busy[r.index]),digitalRead(board::dio9[r.index])); return;
+    case CMD_SPEED:
+        if (q.speed_hz>board::stream_spi) { failure(r,q.id,"speed_max_16000000","validate"); return; }
+        // ESP32 APB divides 80 MHz: unlike Pico, 16 MHz is exactly achievable.
+        r.speed=spiClockDivToFrequency(spiFrequencyToClockDiv(q.speed_hz));
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"spi_hz\":%lu}\n",(unsigned long)q.id,(unsigned long)r.speed); return;
+    case CMD_RESET:
+        resetRadio(r);
+        if (!ready(r,q.timeout_ms)) { failure(r,q.id,"busy_timeout","after_reset"); return; }
+        break;
+    case CMD_WAIT:
+        if (!ready(r,q.timeout_ms)) { failure(r,q.id,"busy_timeout","wait"); return; }
+        break;
+    case CMD_STREAM: case CMD_STREAM2: stream(r); return;
+    case CMD_READ: case CMD_WRITE: case CMD_XFER: {
+        String out; out.reserve(2*(q.tx_len+q.read_len)+200);
+        uint8_t *cmdRx=static_cast<uint8_t *>(malloc(q.tx_len));
+        if (!cmdRx) { failure(r,q.id,"out_of_memory","command"); return; }
+        {
+            BusLock lock;
+            if (!ready(r,q.timeout_ms)) { free(cmdRx); failure(r,q.id,"busy_timeout","before_command"); return; }
+            transfer(r,q.tx,cmdRx,q.tx_len);
+            delayMicroseconds(95);
+            if (q.command!=CMD_XFER && !ready(r,q.timeout_ms)) { free(cmdRx); failure(r,q.id,"busy_timeout","after_command",true); return; }
+            if (q.command==CMD_READ) transfer(r,nullptr,r.rx,q.read_len+1);
+        }
+        out="{\"id\":"+String(q.id)+",\"ok\":true,";
+        if (q.command==CMD_READ) {
+            out+="\"status\":"+String(r.rx[0])+",\"cmd_status\":"+String(r.rx[0]>>1)+",\"data\":\"";
+            hexAppend(out,r.rx+1,q.read_len); out+="\",\"command_rx\":\"";
+        } else out+="\"rx\":\"";
+        hexAppend(out,cmdRx,q.tx_len); free(cmdRx); out+="\"}\n";
+        if (!sendBytes(r,reinterpret_cast<const uint8_t *>(out.c_str()),out.length())) r.client.stop();
+        return;
+    }
+    default: failure(r,q.id,"unsupported_on_nomad","command"); return;
+    }
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"busy\":%d}\n",(unsigned long)q.id,digitalRead(board::busy[r.index]));
+}
+static void serve(void *arg) {
+    Radio &r=*static_cast<Radio *>(arg);
+    for (;;) {
+        r.client=servers[r.index].available();
+        if (!r.client) { delay(10); continue; }
+        if (xSemaphoreTake(r.owner,0)!=pdTRUE) { r.client.stop(); continue; }
+        r.io=&r.client; r.serialSession=false;
+        r.client.setNoDelay(true); r.client.setTimeout(2);
+        size_t used=0; bool discard=false; uint64_t last=now();
+        while (r.client.connected()) {
+            // Reject additional owners rather than leaving stale sessions queued.
+            WiFiClient extra=servers[r.index].available(); if (extra) extra.stop();
+            if (!r.io->available()) {
+                if (used && now()-last>2000000) { used=0; discard=true; }
+                delay(1); continue;
+            }
+            int c=r.io->read(); last=now(); if (c=='\r') continue;
+            if (c=='\n') {
+                if (discard) failure(r,0,"invalid_or_incomplete_line","parse");
+                else if (used) {
+                    r.line[used]=0; const char *error;
+                    if (networkRequest(r.line,*r.io,false)) {}
+                    else if (parseNomadRequest(r.line,&r.req,&r.compact,&r.decimated,&error)) request(r);
+                    else failure(r,r.req.id,error,"parse");
+                }
+                used=0; discard=false;
+            } else if (!discard) {
+                if ((c<32 && c!='\t') || c>126 || used+1>=sizeof(r.line)) discard=true;
+                else r.line[used++]=char(c);
+            }
+        }
+        r.client.stop(); resetRadio(r); // Release only this radio on disconnect.
+        r.speed=500000;
+        xSemaphoreGive(r.owner);
+    }
+}
+void setup() {
+    Serial.begin(board::uart_baud);
+    spiMutex=xSemaphoreCreateMutex();
+    streamMutex=xSemaphoreCreateMutex();
+    if (!spiMutex || !streamMutex) abort();
+    // Keep the external PA control at zero; hold backpack in reset so its
+    // original ELRS auxiliary firmware cannot interfere with this experiment.
+    pinMode(board::pa_apc,OUTPUT); digitalWrite(board::pa_apc,LOW);
+    pinMode(board::backpack_en,OUTPUT); digitalWrite(board::backpack_en,LOW);
+    indicatorsBegin();
+    for (unsigned i=0;i<2;++i) {
+        Radio &r=radios[i]; r.index=i;
+        r.owner=xSemaphoreCreateMutex();
+        if (!r.owner) abort();
+        digitalWrite(board::cs[i],HIGH); pinMode(board::cs[i],OUTPUT);
+        digitalWrite(board::reset[i],LOW); pinMode(board::reset[i],OUTPUT);
+        pinMode(board::busy[i],INPUT); pinMode(board::dio9[i],INPUT);
+        r.queueStorage=static_cast<uint8_t *>(malloc(board::queue_frames*sizeof(Frame)));
+        if(!r.queueStorage)abort();
+        r.queueCapacity=board::queue_frames;
+        r.queue=xQueueCreateStatic(board::queue_frames,sizeof(Frame),r.queueStorage,&r.queueControl);
+        if (!r.queue) abort();
+    }
+    radioSPI.begin(board::sck,board::miso,board::mosi,-1);
+    for (Radio &r:radios) resetRadio(r);
+    loadWifiCredentials();
+    startNetwork();
+    for (unsigned i=0;i<2;++i) {
+        servers[i].begin(); servers[i].setNoDelay(true);
+        if (xTaskCreatePinnedToCore(serve,i?"radio1":"radio0",8192,&radios[i],2,nullptr,0)!=pdPASS) abort();
+    }
+    if (xTaskCreatePinnedToCore(acquire,"acquire",4096,nullptr,3,nullptr,1)!=pdPASS) abort();
+    Serial.printf("Nomad SDR: %s mode, TCP 1121 / 1122; use '<id> wifi' for IP/status\n",staEnabled()?"STA":"AP");
+}
+void loop() {
+    networkTick();
+    indicatorsTick(radios[0].active.load(),radios[1].active.load(),
+        radios[0].flags,radios[1].flags,
+        radios[0].queue?uxQueueMessagesWaiting(radios[0].queue):0,radios[0].queueCapacity,
+        radios[1].queue?uxQueueMessagesWaiting(radios[1].queue):0,radios[1].queueCapacity);
+    static char consoleLine[BRIDGE_LINE_SIZE];
+    static request_t consoleReq;
+    static bool consoleCompact=false;
+    static bool consoleDecimated=false;
+    static unsigned selectedRadio=0;
+    static size_t used=0;
+    static bool discard=false;
+    static uint64_t last=0;
+    if (used && now()-last>2000000) { used=0; discard=true; }
+    while (Serial.available()) {
+        int c=Serial.read(); last=now();
+        if (c=='\r') continue;
+        if (c=='\n') {
+            if (discard) Serial.println("{\"id\":0,\"ok\":false,\"error\":\"invalid_or_incomplete_line\",\"phase\":\"parse\"}");
+            else if (used) {
+                consoleLine[used]=0;
+                unsigned long id=0; unsigned index=0; char trailing=0;
+                if (networkRequest(consoleLine,Serial,true)) {}
+                else if (sscanf(consoleLine,"%lu radio %u %c",&id,&index,&trailing)==2 && id>0 && index<2) {
+                    // Selection alone does not issue SPI or reset either chip.
+                    selectedRadio=index;
+                    Serial.printf("{\"id\":%lu,\"ok\":true,\"radio\":%u}\n",id,index);
+                } else {
+                    const char *error;
+                    if (!parseNomadRequest(consoleLine,&consoleReq,&consoleCompact,&consoleDecimated,&error)) {
+                        Serial.printf("{\"id\":%lu,\"ok\":false,\"error\":\"%s\",\"phase\":\"parse\"}\n",(unsigned long)consoleReq.id,error);
+                    } else {
+                        Radio &r=radios[selectedRadio];
+                        if (xSemaphoreTake(r.owner,0)!=pdTRUE) {
+                            Serial.printf("{\"id\":%lu,\"ok\":false,\"error\":\"radio_owned_by_tcp\",\"phase\":\"admission\"}\n",(unsigned long)consoleReq.id);
+                        } else {
+                            r.req=consoleReq; r.compact=consoleCompact;r.decimated=consoleDecimated;r.io=&Serial; r.serialSession=true;
+                            request(r);
+                            Serial.flush();
+                            r.io=&r.client; r.serialSession=false;
+                            xSemaphoreGive(r.owner);
+                        }
+                    }
+                }
+            }
+            used=0; discard=false;
+        } else if (!discard) {
+            if ((c<32 && c!='\t') || c>126 || used+1>=sizeof(consoleLine)) discard=true;
+            else consoleLine[used++]=char(c);
+        }
+    }
+    delay(1);
+}

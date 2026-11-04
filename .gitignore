@@ -1,0 +1,10 @@
+/build/
+/dist/
+/.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.dSYM/
+/nomad/.pio/
+/nomad/src/wifi.local.h
+/.vscode/
