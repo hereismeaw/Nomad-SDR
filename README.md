@@ -36,6 +36,21 @@ python host/nomad_rtl_tcp.py --host 192.168.4.1 --radio 0 --port 1234
 | Status | Full-brightness RGB: blue ready, green working, yellow buffered, red error |
 | Thermal | Fan on at 50 °C die temperature, off at 42 °C |
 
+## Frequency
+
+Both radios tune **150-2500 MHz**. That is the LR1121 synthesizer span, not a promise of even sensitivity.
+
+| Band | Support |
+| --- | --- |
+| 150-960 MHz | Specified RX. Nomad matching and antennas are strongest near 900 MHz (915 MHz is the usual first tune). |
+| 1900-2200 MHz | Specified RX. |
+| 2400-2500 MHz | Specified RX. Nomad 2.4 GHz antennas (2440 MHz is the usual first tune). |
+| Gaps in 960-1900 and 2200-2400 MHz | Synthesizer will go there (1090, 1550, 2300 MHz were tried). Treat those as experiments. |
+| Below 150 MHz | Out of range. FM broadcast 88-108 MHz is not supported. |
+| Above 2500 MHz | Out of range. |
+
+Native I/Q is 62.5 kS/s (USB LID8 31.25 kS/s). The 250 kHz rate in SDRangel is interpolated on the PC.
+
 Guides: [USB native](docs/usb-native.md) · [live SDR](docs/live-sdr.md) · [Nomad port](docs/nomad.md) · [LIQ8](docs/LIQ8.md)
 
 ## Build and flash
