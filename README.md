@@ -2,6 +2,8 @@
 
 **Two Semtech LR1121 radios on a RadioMaster Nomad — 150–2500 MHz receive, waterfall in SDRangel / SDR++, JSON control API.**
 
+`#SDR` `#software-defined-radio` `#LR1121` `#RadioMaster` `#Nomad` `#ExpressLRS` `#SDRangel` `#SDRPlusPlus` `#rtl_tcp` `#LoRa` `#GFSK` `#ESP32` `#hamradio`
+
 ![Nomad-SDR live in SDRangel](docs/images/nomad-sdrangel.jpg)
 
 Firmware on the Nomad's main ESP32 turns the stock dual-LR1121 Gemini board into an I/Q receiver. Tune from SDRangel or SDR++, and keep ExpressLRS a restore away.
