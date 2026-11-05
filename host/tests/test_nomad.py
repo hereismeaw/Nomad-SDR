@@ -215,6 +215,13 @@ class NomadTests(unittest.TestCase):
             main(['--port', 'COM3', '--radio', 'both', '--output', 'unused.cf32'])
         bridge.assert_not_called()
 
+    def test_uart_decimation_implies_compact_before_block_limit(self):
+        with tempfile.TemporaryDirectory() as folder, patch('nomad_rx.Bridge', side_effect=RuntimeError('opened')) as bridge:
+            with self.assertRaisesRegex(RuntimeError, 'opened'):
+                capture('localhost', 0, 915000000, 62500, 2,
+                        Path(folder) / 'decimated.cf32', port='COM3', decimate=True)
+            bridge.assert_called_once()
+
     def test_capture_metadata_reports_loss_and_does_not_overwrite(self):
         b = Bridge(transport=io.BytesIO())
         b._id = 1

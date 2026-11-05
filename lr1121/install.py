@@ -163,6 +163,22 @@ def flash(b, image, out, expected_app=APP):
         save(out/'flash-result.json', report)
 
 
+def initialize_verification_radio(b):
+    info = b.info()
+    if info.get('board') != 'radiomaster-nomad':
+        return Core1121(b).initialize()
+    if info.get('radio') not in (0, 1):
+        raise RuntimeError('Invalid Nomad radio identity')
+    # Callback self-test needs crystal standby, not RX or a DMA ring. Do not
+    # use the Waveshare TCXO/LF-clock profile on the Nomad's crystal board.
+    from nomad_rx import NomadReceiver
+    receiver = NomadReceiver(b)
+    for command, mode in (('011c00', 1), ('011001', 1),
+                          ('01120f00040808020001', 1), ('010e', 1),
+                          ('010f3f', 1), ('011400800000', 1), ('011c01', 2)):
+        receiver.write(command, mode)
+
+
 def verify(b, out):
     result = dict(success=False)
     (out/'binding.cmake').unlink(missing_ok=True)
@@ -170,7 +186,7 @@ def verify(b, out):
         b.speed(500000); b.reset()
         if b.version()['data'] != APP:
             raise RuntimeError('Extension requires firmware 1.3')
-        Core1121(b).initialize()
+        initialize_verification_radio(b)
         uid = b._payload(b.read_command(bytes.fromhex('0125'), 8), 8).hex()
         callback = word(b, 0x8004ac)
         for address, value in ((0x80f000,0),(0x80f004,callback),(0x80f008,0),(0x80f078,0),

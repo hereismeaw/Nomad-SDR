@@ -20,7 +20,44 @@ def compact_frame(sequence=0,shift=6,kind=1):
     head=HEADER.pack(b'LIQ8',1,kind,0,3,sequence,sequence*125,125 if kind==1 else 0,len(payload),62500,0,zlib.crc32(payload),0)
     return head[:40]+struct.pack('<I',zlib.crc32(head[:40]))+payload
 
+def decimated_frame(sequence=0, kind=1, index=None, count=None):
+    samples = (63 if sequence % 2 == 0 else 62) if kind == 1 else 0
+    payload = bytes([6]) + bytes([64,192])*samples if kind == 1 else struct.pack('<9I',sequence,sequence,0,0,0,16000000,0,0,0)
+    head = HEADER.pack(b'LID8',1,kind,0,3,sequence,
+                       (sequence*125+1)//2 if index is None else index,
+                       samples if count is None else count,len(payload),31250,0,zlib.crc32(payload),0)
+    return head[:40]+struct.pack('<I',zlib.crc32(head[:40]))+payload
+
 class RTLTests(unittest.TestCase):
+    def test_decimated_alternating_frames_and_terminal(self):
+        for sequence, count in ((0,63),(1,62),(2,63),(3,62)):
+            data, end = read_frame(io.BytesIO(decimated_frame(sequence)),3,31250,sequence,compact=True)
+            self.assertIsNone(end)
+            np.testing.assert_array_equal(np.frombuffer(data,dtype='<c8'),np.full(count,(64-64j)*2**-16))
+        data, end = read_frame(io.BytesIO(decimated_frame(3,kind=2)),3,31250,3,compact=True)
+        self.assertIsNone(data)
+        self.assertEqual(end['sent'],3)
+
+    def test_decimated_wrong_index_count_and_crc_rejected(self):
+        for wire, message in ((decimated_frame(1,index=62),'sequence'),
+                              (decimated_frame(1,count=63),'dimensions')):
+            with self.assertRaisesRegex(BridgeError,message):
+                read_frame(io.BytesIO(wire),3,31250,1,compact=True)
+        wire = bytearray(decimated_frame(1)); wire[-1] ^= 1
+        with self.assertRaisesRegex(BridgeError,'CRC'):
+            read_frame(io.BytesIO(wire),3,31250,1,compact=True)
+
+    def test_decimated_interpolator_keeps_odd_bank_boundaries(self):
+        samples = np.exp(2j*np.pi*5000*np.arange(1250)/31250)
+        whole = Interpolator(250000,31250).process(samples)
+        split = Interpolator(250000,31250)
+        parts = []
+        offset = 0
+        for count in (63,62)*10:
+            parts.append(split.process(samples[offset:offset+count])); offset += count
+        np.testing.assert_allclose(whole,np.concatenate(parts),atol=1e-12)
+        self.assertEqual(len(whole),10000)
+
     def test_compact_scale_sign_and_terminal(self):
         data,end=read_frame(io.BytesIO(compact_frame()),3,62500,0,compact=True)
         self.assertIsNone(end)

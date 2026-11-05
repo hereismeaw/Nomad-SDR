@@ -10,6 +10,24 @@ spec=importlib.util.spec_from_file_location('installer',Path(__file__).resolve()
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 class ImageGuards(unittest.TestCase):
+    def test_nomad_verification_uses_crystal_profile_without_rx(self):
+        b = Mock()
+        b.info.return_value = dict(board='radiomaster-nomad', radio=1)
+        with patch('nomad_rx.NomadReceiver') as receiver, patch.object(m, 'Core1121') as waveshare:
+            m.initialize_verification_radio(b)
+            commands = [call.args for call in receiver.return_value.write.call_args_list]
+            self.assertEqual(commands[-1], ('011c01', 2))
+            self.assertIn(('01120f00040808020001', 1), commands)
+            self.assertFalse(any(command.startswith(('0117', '0116', '0209', '020a')) for command, _ in commands))
+            waveshare.assert_not_called()
+
+    def test_invalid_nomad_radio_rejected_before_initialization(self):
+        b = Mock()
+        b.info.return_value = dict(board='radiomaster-nomad', radio=2)
+        with self.assertRaisesRegex(RuntimeError, 'identity'):
+            m.initialize_verification_radio(b)
+        b.write_command.assert_not_called()
+
     def test_stock_digest(self):
         self.assertEqual(len(m.stock_image(m.VENDOR)),66592)
     def test_layout(self):

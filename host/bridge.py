@@ -167,6 +167,12 @@ class Bridge:
     def pins(self):
         return self.request("pins")
 
+    def capabilities(self):
+        return self.request('capabilities')
+
+    def stream_status(self):
+        return self.request('stream status')
+
     @staticmethod
     def _wifi_token(value):
         text = "" if value is None else str(value)
@@ -298,7 +304,7 @@ def main(argv=None):
     parser.add_argument("--radio", type=int, choices=(0, 1), help="Select Nomad radio on the main ESP32 UART")
     parser.add_argument("--log", type=Path, help="Append request/response JSONL log")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("ports", "info", "pins", "reset", "wait", "version", "status", "errors", "probe", "bootsel", "rf-init", "rx-stop"):
+    for name in ("ports", "info", "pins", "reset", "wait", "version", "status", "errors", "probe", "bootsel", "rf-init", "rx-stop", "capabilities", "stream-status"):
         commands.add_parser(name)
     wifi = commands.add_parser("wifi", help="Nomad Wi-Fi status, or UART STA/AP provisioning")
     wifi.add_argument("mode", nargs="?", choices=("sta", "ap"))
@@ -334,6 +340,8 @@ def main(argv=None):
             with Bridge(args.port, args.timeout_ms, args.log, nomad_radio=args.radio) as bridge:
                 if args.command == "info":
                     result = bridge.info()
+                elif args.command == 'stream-status':
+                    result = bridge.stream_status()
                 elif args.command == "fan":
                     result = bridge.fan(args.mode)
                 elif args.command == "led":

@@ -8,6 +8,9 @@ extern "C" {
 #endif
 /* 125 complex signed-23 samples -> shift byte + 250 signed-8 components. */
 bool nomad_pack8(uint8_t *dst, const uint8_t *src);
+/* ARC bank: 64 big-endian SPI words, ready/shift/24-bit sequence then IQ8. */
+bool nomad_arc8(uint8_t *dst, const uint8_t *words_be, uint32_t sequence);
+bool nomad_expand8(uint8_t *dst, const uint8_t *src);
 typedef struct {
     int32_t i[33], q[33];
     unsigned position, phase;

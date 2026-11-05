@@ -73,7 +73,18 @@ Restore ExpressLRS with `python lr1121/install.py restore-elrs` plus a full-flas
 
 ## Honest limits
 
-Continuous 2.4 GHz and dual-radio streaming are still rough. Sensitivity outside Nomad's matched bands is unproven. The Pico LIP2/LIP3 250/500 kS/s path, TX, and native SDR++ module stay on the upstream RP2040 tree.
+Nomad 0.11.0 adds native capabilities/stream telemetry and a local
+[JSON control API](docs/control-api.md) for RX, sweep, packet monitoring, CAD,
+gain, diagnostics and dual jobs. Launch `Start-Nomad-API.cmd` or run
+`python host/nomad_api.py --serial COM3`. The API holds COM3; close it before
+starting a separate USB I/Q proxy.
+
+Firmware 0.10.0 adds [experimental ARC packed acquisition](docs/packed-stream.md)
+for the verified radio 1 extension. USB passed two 60-second tests with retunes;
+native 125 kS/s was tested only with a short bounded capture. Enable it explicitly
+with `--packed-verification`; normal acquisition remains the default.
+
+Continuous Wi-Fi I/Q at 2.4 GHz and dual-radio I/Q still need validation. Sensitivity outside Nomad's matched bands is unproven. The Pico LIP2/LIP3 250/500 kS/s path, TX, and native SDR++ module stay on the upstream RP2040 tree.
 
 ## Layout
 

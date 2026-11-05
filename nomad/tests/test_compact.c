@@ -31,6 +31,30 @@ static double tone(double frequency) {
 }
 int main(void) {
     uint8_t input[750],output[251];
+    uint8_t arc[256]={0};
+    arc[0]=0x85;arc[3]=1;
+    for(unsigned i=0;i<250;++i) {
+        unsigned offset=i+4;
+        arc[(offset&~3u)+3-(offset&3)]=(uint8_t)i;
+    }
+    assert(nomad_arc8(output,arc,0));assert(output[0]==5);
+    for(unsigned i=0;i<250;++i)assert(output[i+1]==(uint8_t)i);
+    assert(!nomad_arc8(output,arc,1));
+    arc[0]=0x91;assert(!nomad_arc8(output,arc,0));
+    arc[0]=5;assert(!nomad_arc8(output,arc,0));
+    arc[0]=0x85;arc[3]=0;
+    assert(nomad_arc8(output,arc,0xffffff));
+    assert(nomad_expand8(input,output));
+    for(unsigned i=0;i<250;++i) {
+        int32_t value=(int32_t)(input[3*i]|(uint32_t)input[3*i+1]<<8|(uint32_t)input[3*i+2]<<16);
+        value=(value&0x3fffff)-(value&0x400000);
+        assert(value==(int8_t)i*32);
+    }
+    output[0]=16;output[1]=127;output[2]=128;
+    assert(nomad_expand8(input,output));
+    assert(input[0]==255 && input[1]==255 && input[2]==63);
+    assert(input[3]==0 && input[4]==0 && input[5]==64);
+    output[0]=17;assert(!nomad_expand8(input,output));
     uint32_t random=12345;
     for (unsigned trial=0;trial<200;++trial) {
         int32_t originals[250];

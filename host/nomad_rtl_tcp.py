@@ -68,9 +68,10 @@ class Settings:
 
 
 class ClientSession:
-    def __init__(self, client, host, radio, frequency, output_rate, gain_db, report=None,stream_rate=31250,buffer_ms=250,serial=None):
+    def __init__(self, client, host, radio, frequency, output_rate, gain_db, report=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None):
         self.client, self.host, self.radio = client, host, radio
         self.serial = serial
+        self.packed_verification = packed_verification
         self.gain_db, self.report_path = gain_db, report
         self.stream_rate,self.buffer_ms=stream_rate,buffer_ms
         self.settings = Settings(frequency, output_rate)
@@ -227,6 +228,8 @@ class ClientSession:
         commands = threading.Thread(target=self.read_commands, name='rtl-commands', daemon=True)
         commands.start()
         try:
+            if self.serial and self.packed_verification is not None and self.stream_rate!=31250:
+                raise BridgeError('Experimental packed USB live requires --stream-rate 31250 to fit the UART')
             while not self.stop.is_set():
                 self.settle_settings()
                 settings, generation = self.snapshot()
@@ -247,10 +250,21 @@ class ClientSession:
                         raise BridgeError('Install Nomad firmware 0.4.0 or newer for compact live streaming')
                     if self.stream_rate==31250 and info.get('decimated_stream')!='LID8':
                         raise BridgeError('Install Nomad firmware 0.5.0 for the stable 31.25 kS/s stream')
-                    NomadReceiver(b).configure(settings.corrected_frequency, NATIVE_RATE)
+                    verified=None
+                    if self.packed_verification is not None:
+                        from nomad_extension_probe import prepare_packed
+                        verified=json.loads(Path(self.packed_verification).read_text())
+                        prepare_packed(b,settings.corrected_frequency,NATIVE_RATE,verified)
+                        job['acquisition']='arc8'
+                    else:
+                        NomadReceiver(b).configure(settings.corrected_frequency, NATIVE_RATE)
                     if self.stop.is_set():
                         break
-                    ack = b.request(f'{"streamd" if self.stream_rate==31250 else "stream8"} {NATIVE_RATE} 0')
+                    command='streampd' if self.stream_rate==31250 else 'streamp8'
+                    wire=f'{command} {NATIVE_RATE} 0 {verified["uid"]}' if verified is not None else f'{"streamd" if self.stream_rate==31250 else "stream8"} {NATIVE_RATE} 0'
+                    ack = b.request(wire)
+                    if verified is not None and ack.get('acquisition')!='arc8':
+                        raise BridgeError('Expected ARC acquisition acknowledgement',ack)
                     if ack.get('stream') != ('LID8' if self.stream_rate==31250 else 'LIQ8') or ack.get('format') != 'iq8_block_float':
                         raise BridgeError('Unexpected compact stream acknowledgement', ack)
                     self.pipe_stream(b,job,generation,interpolator)
@@ -274,7 +288,7 @@ class ClientSession:
 
 
 def serve(host='192.168.4.1', radio=0, listen='127.0.0.1', port=1234,
-          frequency=915000000, output_rate=250000, gain_db=60.0, report=None, ready=None, stop=None,stream_rate=31250,buffer_ms=250,serial=None):
+          frequency=915000000, output_rate=250000, gain_db=60.0, report=None, ready=None, stop=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None):
     stop = stop or threading.Event()
     with socket.socket() as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -293,7 +307,7 @@ def serve(host='192.168.4.1', radio=0, listen='127.0.0.1', port=1234,
                 except socket.timeout:
                     continue
                 LOG.info('Client connected: %s', address)
-                ClientSession(client, host, radio, frequency, output_rate, gain_db, report,stream_rate,buffer_ms,serial).run()
+                ClientSession(client, host, radio, frequency, output_rate, gain_db, report,stream_rate,buffer_ms,serial,packed_verification).run()
         except KeyboardInterrupt:
             LOG.info('Server stopped')
 
@@ -302,13 +316,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--host', default=None, help='Nomad IP from the UART wifi command')
     p.add_argument('--serial', help='USB native mode: main ESP32 UART such as COM3')
+    p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: successful per-chip FIFO1 verify.json')
     p.add_argument('--radio', type=int, choices=(0, 1), default=0)
     p.add_argument('--listen', default='127.0.0.1')
     p.add_argument('--port', type=int, default=1234)
     p.add_argument('--frequency', type=int, default=915000000)
     p.add_argument('--output-rate', type=int, choices=OUTPUT_RATES, default=250000)
     p.add_argument('--gain-db', type=float, default=60.0, help='Software gain before rtl_tcp 8-bit output')
-    p.add_argument('--stream-rate', type=int, choices=(31250,62500), default=None, help='Native I/Q rate; USB defaults to 62500, Wi-Fi to 31250')
+    p.add_argument('--stream-rate', type=int, choices=(31250,62500), default=None, help='Stream I/Q rate; USB and Wi-Fi default to 31250')
     p.add_argument('--buffer-ms', type=int, choices=range(50,751), metavar='50..750', default=250, help='Host jitter prebuffer in milliseconds')
     p.add_argument('--report', type=Path, default=Path('build/rtl-tcp-status.json'))
     a = p.parse_args()

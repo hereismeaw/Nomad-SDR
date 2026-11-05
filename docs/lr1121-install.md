@@ -93,6 +93,19 @@ the extension; it does not downgrade to 1.1. If the bridge or radio is unrespons
 power-cycle before retrying. Restore Pico firmware via BOOTSEL if necessary.
 Unknown bootloader identities are deliberately unsupported.
 
+## Nomad experiment
+
+The installer accepts `--radio 0|1` with the main ESP32 UART and now selects
+the Nomad crystal/RF-switch profile for callback verification. It does not use
+the Waveshare TCXO profile on this board. The complete radio-1 test, toolchain,
+capture evidence and application-only restore command are documented in
+[Nomad extension experiment](nomad-extension-experiment.md).
+
+The initial experiment established custom execution and short RF capture.
+Nomad 0.10.0 subsequently adds [experimental continuous packed acquisition](packed-stream.md)
+with LIQ8/LID8 output. Ordinary commands keep their raw-acquisition path.
+The Pico high-rate LIP2/LIP3 protocol is not implemented on ESP32.
+
 After restoring stock, rebuild the Pico without `--binding` and use only the two
 raw modes. The Python RSSI helper can test the board without undocumented DMA
 capture: `python host/bridge.py --port "$PORT" rx-start`, then `rssi`, then

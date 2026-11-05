@@ -19,6 +19,20 @@ USB native: ดับเบิลคลิก `Start-Nomad-USB.cmd` หรือ
 python host/nomad_rtl_tcp.py --serial COM3 --radio 0 --port 1234
 ```
 
+USB ใช้เฟิร์มแวร์ **0.9.2** ขึ้นไปเพื่อแก้คำสั่งตั้งค่าที่ส่งมาไม่ครบและ queue-full
+จากการส่ง UART ทีละเฟรม ดู [USB native](usb-native.md)
+ค่าเริ่มต้นเป็น LID8 **31.25 kS/s** ทั้ง USB และ Wi-Fi; rate 250 kHz ใน GUI
+เกิดจาก interpolation บน PC ไม่ได้เพิ่ม bandwidth ที่รับจริง
+พัดลม Auto และไฟสถานะ RGB อัปเดตระหว่างสตรีม USB ต่อเนื่องด้วย
+
+รุ่น **0.10.0** เพิ่มทางทดลองให้ LR1121 ชิป 1 แพ็ก I/Q ก่อนส่งผ่าน SPI
+เปิดด้วย `--packed-verification` พร้อมไฟล์ผูกชิป ดู [packed streaming](packed-stream.md)
+ค่าเริ่มต้นยังใช้ทางรับเดิม
+
+รุ่น **0.11.0** มี [control API](control-api.md) สำหรับ capabilities/status,
+RX, sweep, packet, CAD, gain, diagnostics และแบ่งงานสองชิป
+ปิด API server ก่อนเปิด USB I/Q proxy เพราะ COM3 ใช้ได้ทีละโปรแกรม
+
 Wi-Fi: ดับเบิลคลิก `Start-Nomad-SDR.cmd` (ค่าเริ่ม AP `192.168.4.1`) หรือส่ง `--host` เป็น IP จาก `wifi`
 
 ```powershell

@@ -39,6 +39,7 @@ static char staPass[65];
 static bool wifiStored=false;
 static Preferences wifiPrefs;
 static bool wifiConfigure(const char *line,Print &out,uint32_t id,bool uart);
+static bool telemetryRequest(const char *line,Print &out,uint32_t id);
 
 static bool staEnabled() { return staSsid[0]!=0; }
 static String jsonString(const String &value) {
@@ -66,6 +67,7 @@ static bool networkRequest(const char *line,Print &out,bool uart) {
     int tokens=sscanf(line,"%lu %15s %c",&id,command,&extra);
     if (tokens<2 || !id) return false;
     if (indicatorsCommand(line,out,id)) return true;
+    if (telemetryRequest(line,out,id)) return true;
     if (!strcmp(command,"wifi")) {
         if (tokens==2) { networkStatus(out,id); return true; }
         return wifiConfigure(line,out,id,uart);
@@ -148,6 +150,7 @@ struct Radio {
     bool serialSession = false;
     bool compact = false;
     bool decimated = false;
+    bool packed = false;
     nomad_decimator_t decimator;
     QueueHandle_t queue;
     StaticQueue_t queueControl;
@@ -161,6 +164,12 @@ struct Radio {
     std::atomic<bool> active{false}, done{false}, stop{false};
     uint32_t flags, produced, readOps, maxQueue, maxBlock, blocks, rate;
     uint32_t jobId;
+    std::atomic<uint32_t> sent{0};
+    uint64_t elapsed=0;
+    // Parser options also change for ordinary RPCs. Keep the last accepted
+    // stream's format separately so info/read requests do not corrupt telemetry.
+    bool streamCompact=false,streamDecimated=false,streamPacked=false;
+    uint32_t streamRate=0;
     uint64_t start, deadline;
 };
 static Radio radios[2];
@@ -235,6 +244,30 @@ struct BusLock {
     ~BusLock() { xSemaphoreGive(spiMutex); }
 };
 static uint64_t now() { return esp_timer_get_time(); }
+static bool telemetryRequest(const char *line,Print &out,uint32_t id) {
+    char command[16]={0},action[16]={0},extra;
+    int n=sscanf(line,"%*u %15s %15s %c",command,action,&extra);
+    if(n==1 && !strcmp(command,"capabilities")) {
+        out.printf("{\"id\":%lu,\"ok\":true,\"schema\":1,\"board\":\"radiomaster-nomad\",\"radios\":2,\"frequency_hz\":[150000000,2500000000],\"native_rates\":[62500,125000],\"streams\":[\"LIQ1\",\"LIQ8\",\"LID8\"],\"packed_requires_per_chip_verification\":true,\"packed_extension_probed\":false,\"usb_live_native_rate\":62500,\"usb_live_output_rate\":31250,\"uart_baud\":%lu,\"packed_usb_burst_max_banks\":128,\"fan\":true,\"rgb_leds\":2,\"control_api\":\"host/nomad_api.py\"}\n",(unsigned long)id,(unsigned long)board::uart_baud);
+        return true;
+    }
+    if(n!=2 || strcmp(command,"stream") || strcmp(action,"status"))return false;
+    out.printf("{\"id\":%lu,\"ok\":true,\"uptime_ms\":%lu,\"free_heap\":%u,\"radios\":[",(unsigned long)id,(unsigned long)millis(),ESP.getFreeHeap());
+    for(unsigned i=0;i<2;++i) {
+        Radio &r=radios[i];bool active=r.active.load();uint32_t sent=r.sent.load();
+        uint64_t elapsed=active&&r.start?now()-r.start:r.elapsed;
+        uint64_t dataBytes=r.streamDecimated?uint64_t(sent/2)*340+(sent&1?171:0):uint64_t(sent)*(IQ_HEADER_BYTES+(r.streamCompact?COMPACT_PAYLOAD_BYTES:IQ_PAYLOAD_BYTES));
+        out.printf("%s{\"radio\":%u,\"active\":%s,\"job_id\":%lu,\"acquisition\":\"%s\",\"native_rate\":%lu,\"output_rate\":%lu,\"produced\":%lu,\"sent\":%lu,\"pending_frames_estimate\":%lu,\"queue_capacity\":%u,\"max_queue\":%lu,\"flags\":%lu,\"read_ops\":%lu,\"elapsed_us\":%llu",i?",":"",i,active?"true":"false",(unsigned long)r.jobId,r.streamPacked?"arc8":"raw23",(unsigned long)r.streamRate,(unsigned long)(r.streamDecimated?r.streamRate/2:r.streamRate),(unsigned long)r.produced,(unsigned long)sent,(unsigned long)(r.produced>=sent?r.produced-sent:0),r.queueCapacity,(unsigned long)r.maxQueue,(unsigned long)r.flags,(unsigned long)r.readOps,(unsigned long long)elapsed);
+        out.printf(",\"data_bytes\":%llu,\"average_bytes_per_second\":%lu,\"loss_detected\":%s}",(unsigned long long)dataBytes,(unsigned long)(elapsed?dataBytes*1000000/elapsed:0),(r.flags&(IQ_DMA_STARVED|IQ_QUEUE_FULL|IQ_USB_LOST|IQ_RADIO_ERROR|IQ_FORMAT_ERROR))?"true":"false");
+    }
+    out.println("]}");return true;
+}
+static void updateIndicators() {
+    indicatorsTick(radios[0].active.load(),radios[1].active.load(),
+        radios[0].flags,radios[1].flags,
+        radios[0].queue?uxQueueMessagesWaiting(radios[0].queue):0,radios[0].queueCapacity,
+        radios[1].queue?uxQueueMessagesWaiting(radios[1].queue):0,radios[1].queueCapacity);
+}
 static void be32(uint8_t *p, uint32_t v) {
     p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v;
 }
@@ -309,11 +342,29 @@ static bool validate(Radio &r) {
     if (!word(r,0xf20124,v) || ((v>>20)&7)!=(r.rate==62500?5u:4u)) return false;
     if (!word(r,0xf20014,v) || (v&0x30000010)!=0x30000000) return false;
     if (!word(r,IQ_POINTER,v) || v!=0x800a00) return false;
-    for (unsigned i=0;i<IQ_BANKS;++i) {
+    if(r.packed) {
+        if(r.req.tx_len!=8)return false;
+        const uint8_t commands[2][2]={{1,1},{1,0x25}};
+        const uint8_t version[4]={0x22,3,1,3};
+        for(unsigned k=0;k<2;++k) {
+            BusLock lock;
+            if(!ready(r,20))return false;
+            transfer(r,commands[k],nullptr,2);
+            if(!ready(r,20))return false;
+            transfer(r,nullptr,r.rx,k?9:5);
+            if((r.rx[0]>>1)!=3 || memcmp(r.rx+1,k?r.req.tx:version,k?8:4))return false;
+        }
+        const uint32_t addresses[]={0x80f000,0x80f008,0x80f00c,0x80f010,0x80f014,0x80f078,0x8004ac};
+        const uint32_t expected[]={0x49515033,1,0,0,8,0x46494631,0x94510};
+        for(unsigned i=0;i<7;++i)if(!word(r,addresses[i],v)||v!=expected[i])return false;
+        for(unsigned i=0;i<16;++i)if(!word(r,0x80f100+i*4,v)||v)return false;
+    }
+    unsigned banks=r.packed?16:IQ_BANKS;
+    for (unsigned i=0;i<banks;++i) {
         if (!readMem(r,iq_descriptor(i),4)) return false;
         if (iq_be32(r.rx+1)!=IQ_CONTROL || iq_be32(r.rx+5)!=0x901004 ||
-            iq_be32(r.rx+9)!=IQ_DATA_BASE+(i+1)*IQ_BANK_BYTES-4 ||
-            iq_be32(r.rx+13)!=iq_descriptor((i+1)%IQ_BANKS)) return false;
+            iq_be32(r.rx+9)!=(r.packed?IQ_DATA_BASE+i*2048+996:IQ_DATA_BASE+(i+1)*IQ_BANK_BYTES-4) ||
+            iq_be32(r.rx+13)!=iq_descriptor((i+1)%banks)) return false;
     }
     return true;
 }
@@ -321,6 +372,9 @@ static void finishAcquisition(Radio &r) {
     if (!gate(r,false)) {
         r.flags|=IQ_RADIO_ERROR;
         resetRadio(r); // A stuck command must not leave acquisition running.
+    }
+    if(r.packed && !masked(r,0x80f008,0xffffffffu,0)) {
+        r.flags|=IQ_RADIO_ERROR;resetRadio(r);
     }
     r.done.store(true); // Publish counters before the sender reads them.
 }
@@ -340,26 +394,34 @@ static void acquire(void *) {
             if (r.stop.load()) r.flags|=IQ_ABORT;
             if (now()>=r.deadline) r.flags|=IQ_DEADLINE;
             if (r.flags || (r.blocks && r.produced>=r.blocks)) { finishAcquisition(r); continue; }
-            uint32_t bank=r.produced%IQ_BANKS, desc=iq_descriptor(bank), control;
-            if (!word(r,desc,control)) { r.flags|=IQ_RADIO_ERROR; finishAcquisition(r); continue; }
-            if (control&3) continue;
+            uint32_t bank=r.produced%(r.packed?16:IQ_BANKS), desc=iq_descriptor(bank), control;
+            if (!word(r,r.packed?0x80f100+bank*4:desc,control)) { r.flags|=IQ_RADIO_ERROR; finishAcquisition(r); continue; }
+            if (r.packed?!(control&0x80000000u):(control&3)!=0) continue;
             work=true;
             uint64_t begin=now();
+            uint8_t arcPayload[COMPACT_PAYLOAD_BYTES];
+            if(r.packed) {
+                if(!readMem(r,IQ_DATA_BASE+bank*2048,64))r.flags|=IQ_RADIO_ERROR;
+                else if(iq_be32(r.rx+1)!=control || !nomad_arc8(arcPayload,r.rx+1,r.produced))r.flags|=IQ_FORMAT_ERROR;
+                else if(r.decimated && !nomad_expand8(frame.bytes+IQ_HEADER_BYTES,arcPayload))r.flags|=IQ_FORMAT_ERROR;
+            } else {
             if ((control&~0x001fff03u)!=(IQ_CONTROL&~0x001fff03u)) r.flags|=IQ_RADIO_ERROR;
             for (unsigned w=0;w<IQ_BANK_BYTES/4 && !r.flags;w+=64) {
                 unsigned n=IQ_BANK_BYTES/4-w; if (n>64) n=64;
                 if (!readMem(r,IQ_DATA_BASE+bank*IQ_BANK_BYTES+w*4,n)) r.flags|=IQ_RADIO_ERROR;
                 else if (!iq_pack23(frame.bytes+IQ_HEADER_BYTES+w*3,r.rx+1,n)) r.flags|=IQ_FORMAT_ERROR;
             }
+            }
             uint32_t pointer=0;
             if (!r.flags) {
-                if (!word(r,IQ_POINTER,pointer) || !pointerValid(pointer)) r.flags|=IQ_RADIO_ERROR;
+                if (!word(r,IQ_POINTER,pointer) || !pointerValid(pointer) || (r.packed && pointer>=IQ_DESC_BASE+16*16)) r.flags|=IQ_RADIO_ERROR;
                 else if (pointer==desc) {
                     if (!word(r,IQ_POINTER,pointer)) r.flags|=IQ_RADIO_ERROR;
                     else if (pointer==desc) r.flags|=IQ_DMA_STARVED;
                 }
             }
             if (!r.flags && !masked(r,desc,0xffffffffu,IQ_CONTROL)) r.flags|=IQ_RADIO_ERROR;
+            if(r.packed && !r.flags && !masked(r,0x80f100+bank*4,0xffffffffu,0))r.flags|=IQ_RADIO_ERROR;
             if (r.flags) { finishAcquisition(r); continue; }
             frame.sequence=r.produced; frame.timestamp=uint32_t(now()-r.start);
             frame.samples=IQ_SAMPLES;frame.payloadBytes=IQ_PAYLOAD_BYTES;
@@ -370,7 +432,8 @@ static void acquire(void *) {
                     if(!frame.samples)r.flags|=IQ_FORMAT_ERROR;
                     frame.payloadBytes=1+frame.samples*2;
                 } else {
-                    if(!nomad_pack8(packed,frame.bytes+IQ_HEADER_BYTES))r.flags|=IQ_FORMAT_ERROR;
+                    if(r.packed)memcpy(packed,arcPayload,COMPACT_PAYLOAD_BYTES);
+                    else if(!nomad_pack8(packed,frame.bytes+IQ_HEADER_BYTES))r.flags|=IQ_FORMAT_ERROR;
                     frame.payloadBytes=COMPACT_PAYLOAD_BYTES;
                 }
                 if(r.flags) {finishAcquisition(r);continue;}
@@ -405,7 +468,14 @@ static void hexAppend(String &s,const uint8_t *data,size_t n) {
 }
 static void stream(Radio &r) {
     request_t &q=r.req;
-    // LIQ1 on CP210x is smoke-only. Compact LIQ8/LID8 at 2 Mbaud is USB native mode.
+    r.packed=q.command==CMD_PACKED;
+    if(r.packed && (q.tx_len!=8 || !r.compact || (q.sample_rate!=62500 && q.sample_rate!=125000))) {
+        failure(r,q.id,"packed_binding_rate_required","validate");return;
+    }
+    if(r.packed && r.serialSession && (q.sample_rate==125000 || !r.decimated) && (!q.iterations || q.iterations>128)) {
+        failure(r,q.id,"packed_uart_bandwidth_max_128_blocks","admission");return;
+    }
+    // LIQ1 on CP210x is smoke-only. LID8 fits the 921600-baud UART.
     if (r.serialSession && !r.compact && (!q.iterations || q.iterations>32)) {
         failure(r,q.id,"serial_capture_max_32_blocks","validate"); return;
     }
@@ -428,9 +498,11 @@ static void stream(Radio &r) {
     if(!r.queue)abort();
     memset(&r.decimator,0,sizeof(r.decimator));
     r.flags=r.produced=r.readOps=r.maxQueue=r.maxBlock=0;
+    r.sent.store(0);r.elapsed=0;
+    r.streamCompact=r.compact;r.streamDecimated=r.decimated;r.streamPacked=r.packed;r.streamRate=r.rate;
     r.start=0; r.stop.store(false); r.done.store(false);
-    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu}\n",
-        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks);
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"acquisition\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu}\n",
+        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.packed?"arc8":"raw23",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks);
     r.active.store(true);
     xSemaphoreGive(streamMutex);
     Frame frame;
@@ -438,7 +510,13 @@ static void stream(Radio &r) {
     uint32_t sent=0;
     size_t groupBytes=0;
     uint64_t dataSent=0;
+    uint64_t lastIndicators=0;
     while (!r.done.load() || uxQueueMessagesWaiting(r.queue) || groupBytes) {
+        // USB stream() runs inside loop(), so keep thermal control and status
+        // LEDs alive here. TCP sessions leave loop() free to do this itself.
+        if (r.serialSession && now()-lastIndicators>=20000) {
+            updateIndicators(); lastIndicators=now();
+        }
         while (r.io->available()) if (r.io->read()==3) r.stop.store(true);
         if ((!r.serialSession && !r.client.connected())) { connected=false; r.stop.store(true); }
         if (xQueueReceive(r.queue,&frame,pdMS_TO_TICKS(5))==pdTRUE) {
@@ -474,10 +552,12 @@ static void stream(Radio &r) {
             groupBytes-=flushBytes;
             memmove(r.networkGroup,r.networkGroup+flushBytes,groupBytes);
         }
+        r.sent.store(sent);
     }
     // done is the synchronization point; producer no longer accesses this job.
     xSemaphoreTake(streamMutex,portMAX_DELAY);
     r.active.store(false);
+    r.elapsed=now()-r.start;
     xSemaphoreGive(streamMutex);
     if (!connected) r.flags|=IQ_USB_LOST; // Existing LIQ1 bit means transport lost.
     uint8_t end[IQ_HEADER_BYTES+36], *stats=end+IQ_HEADER_BYTES;
@@ -497,6 +577,22 @@ static bool parseNomadRequest(char *line,request_t *req,bool *compact,bool *deci
     *compact=false;*decimated=false;
     unsigned long id=0,rate=0,blocks=0;
     char command[16],extra;
+    if(sscanf(line,"%lu %15s",&id,command)==2 && (!strcmp(command,"streamp8") || !strcmp(command,"streampd"))) {
+        char uid[18]={0};uint8_t decoded[8];
+        memset(req,0,sizeof(*req));req->id=id;
+        if(sscanf(line,"%lu %15s %lu %lu %17s %c",&id,command,&rate,&blocks,uid,&extra)!=5 || strlen(uid)!=16) {
+            *error="streamp_rate_blocks_uid";return false;
+        }
+        for(unsigned i=0;i<16;++i) {
+            char c=uid[i];int nibble=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;
+            if(nibble<0){*error="packed_uid_hex";return false;}
+            if(!(i&1))decoded[i/2]=uint8_t(nibble<<4);else decoded[i/2]|=uint8_t(nibble);
+        }
+        char normalized[96];snprintf(normalized,sizeof(normalized),"%lu stream2 %lu %lu",id,rate,blocks);
+        if(!parse_request(normalized,req,error))return false;
+        req->command=CMD_PACKED;req->tx_len=8;memcpy(req->tx,decoded,8);
+        *compact=true;*decimated=!strcmp(command,"streampd");return true;
+    }
     if (sscanf(line,"%lu %15s",&id,command)==2 && (!strcmp(command,"stream8") || !strcmp(command,"streamd"))) {
         if (sscanf(line,"%lu %15s %lu %lu %c",&id,command,&rate,&blocks,&extra)!=4) {
             memset(req,0,sizeof(*req)); req->id=id; *error="stream8_rate_blocks"; return false;
@@ -512,7 +608,7 @@ static void request(Radio &r) {
     request_t &q=r.req;
     switch(q.command) {
     case CMD_INFO:
-        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.9.0\",\"board\":\"radiomaster-nomad\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.11.0\",\"board\":\"radiomaster-nomad\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"experimental_packed_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
             (unsigned long)q.id,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
     case CMD_PINS:
         r.io->printf("{\"id\":%lu,\"ok\":true,\"cs\":%d,\"reset\":%d,\"busy\":%d,\"dio9\":%d}\n",(unsigned long)q.id,
@@ -529,7 +625,7 @@ static void request(Radio &r) {
     case CMD_WAIT:
         if (!ready(r,q.timeout_ms)) { failure(r,q.id,"busy_timeout","wait"); return; }
         break;
-    case CMD_STREAM: case CMD_STREAM2: stream(r); return;
+    case CMD_STREAM: case CMD_STREAM2: case CMD_PACKED: stream(r); return;
     case CMD_READ: case CMD_WRITE: case CMD_XFER: {
         String out; out.reserve(2*(q.tx_len+q.read_len)+200);
         uint8_t *cmdRx=static_cast<uint8_t *>(malloc(q.tx_len));
@@ -592,6 +688,12 @@ static void serve(void *arg) {
     }
 }
 void setup() {
+    // A maximum ASCII SPI command is over 8 KiB. The default 256-byte UART
+    // buffer can overflow while loop() updates indicators at 921600 baud.
+    if (Serial.setRxBufferSize(BRIDGE_LINE_SIZE) < BRIDGE_LINE_SIZE) abort();
+    // Queue complete IQ frames instead of waiting on the 128-byte hardware
+    // FIFO for every write. Per-frame blocking otherwise leaves gaps on TX.
+    if (Serial.setTxBufferSize(4096) < 4096) abort();
     Serial.begin(board::uart_baud);
     spiMutex=xSemaphoreCreateMutex();
     streamMutex=xSemaphoreCreateMutex();
@@ -627,10 +729,7 @@ void setup() {
 }
 void loop() {
     networkTick();
-    indicatorsTick(radios[0].active.load(),radios[1].active.load(),
-        radios[0].flags,radios[1].flags,
-        radios[0].queue?uxQueueMessagesWaiting(radios[0].queue):0,radios[0].queueCapacity,
-        radios[1].queue?uxQueueMessagesWaiting(radios[1].queue):0,radios[1].queueCapacity);
+    updateIndicators();
     static char consoleLine[BRIDGE_LINE_SIZE];
     static request_t consoleReq;
     static bool consoleCompact=false;

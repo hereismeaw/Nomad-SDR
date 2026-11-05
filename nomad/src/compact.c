@@ -28,6 +28,28 @@ static bool pack_components(uint8_t *dst,const uint8_t *src,unsigned count) {
 bool nomad_pack8(uint8_t *dst,const uint8_t *src) {
     return pack_components(dst,src,250);
 }
+bool nomad_arc8(uint8_t *dst,const uint8_t *src,uint32_t sequence) {
+    uint32_t marker=(uint32_t)src[0]<<24|(uint32_t)src[1]<<16|(uint32_t)src[2]<<8|src[3];
+    unsigned shift=(marker>>24)&127;
+    if(!(marker&0x80000000u) || shift>16 || (marker&0xffffffu)!=((sequence+1)&0xffffffu))return false;
+    dst[0]=(uint8_t)shift;
+    for(unsigned i=0;i<250;++i) {
+        unsigned offset=i+4;
+        dst[i+1]=src[(offset&~3u)+3-(offset&3)];
+    }
+    return true;
+}
+bool nomad_expand8(uint8_t *dst,const uint8_t *src) {
+    if(src[0]>16)return false;
+    for(unsigned i=0;i<250;++i) {
+        int32_t value=(int32_t)(int8_t)src[i+1]*(int32_t)(1u<<src[0]);
+        if(value>4194303)value=4194303;
+        if(value< -4194304)value= -4194304;
+        uint32_t bits=(uint32_t)value&0x7fffffu;
+        dst[3*i]=(uint8_t)bits;dst[3*i+1]=(uint8_t)(bits>>8);dst[3*i+2]=(uint8_t)(bits>>16);
+    }
+    return true;
+}
 
 /* firwin(33, .4), Hamming window, Q15, exact unity DC gain. */
 static const int16_t taps[33]={50,0,-81,-74,110,256,0,-496,-413,551,1183,0,

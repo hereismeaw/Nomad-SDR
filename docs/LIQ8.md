@@ -21,7 +21,7 @@ component error is at most half a scaled quantization step. This representation
 preserves the scale per block but reduces component precision. It is not lossless.
 
 The original signed-23 acquisition and DMA ownership checks remain unchanged.
-Packing, CRC and network framing happen in the consumer task. TCP writes may
+Packing happens in the acquisition task; CRC and framing happen in the consumer task. TCP writes may
 contain multiple frames or parts of frames; clients must read by header lengths.
 
 Terminal frames use type 2, payload 36 bytes and the original nine counters/flags.
@@ -30,5 +30,23 @@ ETX termination flag 4 is expected for an explicitly cancelled stream. Queue-ful
 flag 2 is a capture failure. Both header/payload CRCs and continuity must be checked.
 
 62500 S/s requires 147500 B/s per radio including data headers; 125000 S/s
-requires 295000 B/s. The host rtl_tcp bridge uses 62500 S/s natively and FIR
+requires 295000 B/s. Default live streaming uses LID8 below, with PC FIR
 interpolation for the application's requested 62500/125000/250000 S/s rate.
+
+## LID8 decimated stream
+
+`streamd 62500 BLOCKS` enables a stateful 33-tap anti-alias FIR followed by /2
+decimation, then the same block-floating int8 encoding. `BLOCKS` still counts
+native 125-sample banks; zero requests an indefinite stream.
+
+The header keeps the LIQ8 layout and CRC rules but uses magic `LID8` and
+sample rate 31250. Even sequence numbers carry 63 complex samples (127-byte
+payload); odd sequence numbers carry 62 (125-byte payload). Sample index is
+`ceil(sequence*125/2) mod 2**32`, including terminal frames. Data frames are
+171 and 169 bytes respectively, requiring 85000 B/s at 500 banks per second.
+This fits the 921600-baud USB UART, whose 8N1 theoretical limit is 92160 B/s.
+
+Terminal layout and counters are unchanged: produced/sent count native banks,
+not output samples. The sample count after N banks is `ceil(N*125/2)`.
+The 31.25 kS/s stream has a 31.25 kHz Nyquist span with filter roll-off near
+the edges; PC interpolation to 250 kS/s does not widen received RF bandwidth.

@@ -192,7 +192,9 @@ def read_frame(io, job_id, rate, sequence, compact=False):
     return components.tobytes(), None
 
 
-def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=None, compact=False,decimate=False):
+def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=None, compact=False,decimate=False,packed_verification=None):
+    compact = compact or decimate or packed_verification is not None
+    verified = json.loads(Path(packed_verification).read_text()) if packed_verification is not None else None
     if rate not in RATES or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError('Select a supported rate and positive finite duration')
     blocks = math.ceil(seconds * rate / 125)
@@ -200,6 +202,8 @@ def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=No
         raise ValueError('Capture must fit 1..8192 blocks; shorten --seconds')
     if port is not None and not compact and blocks > 32:
         raise ValueError('UART LIQ1 smoke capture is limited to 32 blocks; use --compact or --seconds 0.032 at 62500 S/s')
+    if verified is not None and port is not None and (rate==125000 or not decimate) and blocks>128:
+        raise ValueError('Packed UART capture above transport capacity is limited to 128 blocks; use --decimate at 62500 or TCP')
     endpoint = port or f'socket://{host}:{1121 + radio}'
     metadata = dict(complete=False, endpoint=endpoint, blocks=blocks)
     if compact:
@@ -212,13 +216,21 @@ def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=No
             try:
                 kwargs = dict(nomad_radio=radio) if port is not None else {}
                 with Bridge(endpoint, timeout_ms=1500, **kwargs) as bridge:
-                    metadata.update(NomadReceiver(bridge).configure(frequency, rate))
+                    if verified is not None:
+                        from nomad_extension_probe import prepare_packed
+                        metadata.update(prepare_packed(bridge,frequency,rate,verified))
+                    else:
+                        metadata.update(NomadReceiver(bridge).configure(frequency, rate))
                     if decimate:
                         compact=True
                         metadata.update(wire_format='LID8',acquisition_rate=rate,sample_rate=rate//2)
                     if barrier is not None:
                         barrier.wait(timeout=60)
-                    ack = bridge.request(f'{"streamd" if decimate else "stream8" if compact else "stream2"} {rate} {blocks}')
+                    command = 'streampd' if decimate else 'streamp8'
+                    wire = f'{command} {rate} {blocks} {verified["uid"]}' if verified is not None else f'{"streamd" if decimate else "stream8" if compact else "stream2"} {rate} {blocks}'
+                    ack = bridge.request(wire)
+                    if verified is not None and ack.get('acquisition')!='arc8':
+                        raise BridgeError('Expected ARC packed acquisition acknowledgement',ack)
                     if ack.get('stream') != ('LID8' if decimate else 'LIQ8' if compact else 'LIQ1') or ack.get('format') != ('iq8_block_float' if compact else 'iq23le'):
                         raise BridgeError('Invalid Nomad stream acknowledgement', ack)
                     sequence = 0
@@ -253,6 +265,7 @@ def main(argv=None):
     p.add_argument('--host', default='192.168.4.1')
     p.add_argument('--compact', action='store_true', help='Use LIQ8 block floating I/Q for live networking')
     p.add_argument('--decimate', action='store_true', help='Anti-alias FIR /2 and compact LID8 networking')
+    p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: per-chip successful FIFO1 verify.json')
     p.add_argument('--port', help='Main ESP32 USB UART, e.g. COM3; compact streams are USB native mode')
     p.add_argument('--radio', choices=('0', '1', 'both'), default='0')
     p.add_argument('--frequency', type=int, default=915_000_000)
@@ -261,6 +274,8 @@ def main(argv=None):
     p.add_argument('--seconds', type=float, default=2)
     p.add_argument('--output', type=Path, required=True, help='cf32_le file; both mode adds .radio0/.radio1')
     a = p.parse_args(argv)
+    if a.packed_verification is not None and a.radio=='both':
+        p.error('Experimental packed capture requires selecting one verified radio')
     if a.radio == 'both' and a.rate != 62500:
         p.error('Dual capture supports 62500 S/s per radio; SPI bandwidth is shared')
     if a.port is not None and a.radio == 'both':
@@ -276,7 +291,7 @@ def main(argv=None):
                                     barrier,compact=a.compact,decimate=a.decimate) for i in range(2)]
                 results = [job.result() for job in jobs]
         else:
-            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate)]
+            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate,packed_verification=a.packed_verification)]
         print(json.dumps(results, indent=2))
         return 0
     except (BridgeError, RadioError, OSError, ValueError, RuntimeError) as exc:
